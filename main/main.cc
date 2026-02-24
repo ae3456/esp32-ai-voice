@@ -61,7 +61,7 @@ typedef enum
 
 // 全局变量
 static system_state_t current_state = STATE_WAITING_WAKEUP;
-static TickType_t command_timeout_start = 0;
+// static TickType_t command_timeout_start = 0; // 未使用
 static const TickType_t COMMAND_TIMEOUT_MS = 5000; // 5秒超时
 
 // VAD（语音活动检测）相关变量
@@ -269,6 +269,10 @@ extern "C" void app_main(void)
     int16_t *buffer = nullptr;
     char *model_name = nullptr;
     int16_t *ns_out_buffer = nullptr;  // 噪音抑制输出缓冲区
+    int audio_chunksize = 0;           // 音频块大小，稍后初始化
+    size_t free_heap = 0;              // 内存状态变量，稍后初始化
+    size_t free_internal = 0;
+    size_t free_spiram = 0;
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -320,9 +324,9 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "VAD初始化成功");
 
     ESP_LOGI(TAG, "正在加载唤醒词检测模型...");
-    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 
     ESP_LOGI(TAG, "内存状态检查:");
     ESP_LOGI(TAG, "  - 总可用内存: %zu KB", free_heap / 1024);
@@ -351,7 +355,7 @@ extern "C" void app_main(void)
        goto cleanup;
    }
 
-   int audio_chunksize = wakenet->get_samp_chunksize(model_data) * sizeof(int16_t);
+   audio_chunksize = wakenet->get_samp_chunksize(model_data) * sizeof(int16_t);
    buffer = (int16_t *)malloc(audio_chunksize);
    if (buffer == NULL) {
        ESP_LOGE(TAG, "音频缓冲区内存分配失败");
