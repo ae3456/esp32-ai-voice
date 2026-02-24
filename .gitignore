@@ -1,0 +1,48 @@
+# ESP-IDF 项目通用忽略规则
+
+# 构建输出
+build/
+sdkconfig
+sdkconfig.old
+*.map
+*.bin
+*.elf
+*.list
+
+# 编译中间文件
+*.o
+*.a
+*.d
+*.ld
+*.su
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 环境配置文件
+.env
+.env.local
+.env.*.local
+
+# 日志文件
+*.log
+logs/
+
+# 依赖目录
+managed_components/
+components/
+
+# 项目特定忽略
+# 如果你有自定义的生成文件，在这里添加
+
+# 临时文件
+tmp/
+temp/

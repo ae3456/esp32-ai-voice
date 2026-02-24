@@ -1,0 +1,19 @@
+idf_component_register(SRCS
+        "main.cc"
+        "bsp_board.cc"
+        "websocket_client.cc"
+        "wifi_manager.cc"
+        "audio_manager.cc"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        driver
+        esp_wifi
+        esp_event
+        esp_netif
+        nvs_flash
+        esp_lcd
+        esp_websocket_client
+        esp-sr
+        esp_timer
+        heap
+)

@@ -1,0 +1,41 @@
+// 替换第 430-457 行的代码：
+
+                    if (!is_realtime_streaming) {
+                        is_realtime_streaming = true;
+                        ESP_LOGI(TAG, "检测到说话，补发前500ms数据并开始实时传输...");
+                        // 1. 计算需要回溯多少数据 (比如 500ms)
+                        // 500ms * 16000Hz = 8000 样本
+                        const size_t PREROLL_SAMPLES = 8000; 
+                        // 每次最多发送 1000 样本 (2000 字节)
+                        const size_t MAX_CHUNK_SAMPLES = 1000;
+                        
+                        size_t current_len = 0;
+                        const int16_t* full_buffer = audio_manager->getRecordingBuffer(current_len);
+                        
+                        // 2. 计算起始位置
+                        size_t start_pos = 0;
+                        if (current_len > PREROLL_SAMPLES) {
+                            start_pos = current_len - PREROLL_SAMPLES;
+                        }
+                        
+                        // 3. 计算要发送的总长度
+                        size_t send_samples = current_len - start_pos;
+                        
+                        // 4. 【关键修复】分块发送，避免一次性发送太多导致断开
+                        if (send_samples > 0 && websocket_client != nullptr && websocket_client->isConnected()) {
+                            size_t sent = 0;
+                            while (sent < send_samples && websocket_client->isConnected()) {
+                                size_t chunk = (send_samples - sent > MAX_CHUNK_SAMPLES) ? 
+                                               MAX_CHUNK_SAMPLES : (send_samples - sent);
+                                
+                                websocket_client->sendBinary(
+                                    (const uint8_t*)(full_buffer + start_pos + sent), 
+                                    chunk * sizeof(int16_t)
+                                );
+                                
+                                sent += chunk;
+                                vTaskDelay(pdMS_TO_TICKS(5)); // 每块之间延时5ms
+                            }
+                            ESP_LOGI(TAG, "已补发 %zu/%zu 样本的历史音频", sent, send_samples);
+                        }
+                    }
