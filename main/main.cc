@@ -56,7 +56,8 @@ typedef enum
    STATE_WAITING_WAKEUP = 0,   // 状态一：等待唤醒
    STATE_RECORDING = 1,        // 状态二：正在录音
    STATE_WAITING_RESPONSE = 2, // 状态三：等待AI回复
-   STATE_PLAYING_FINISHED_WAITING = 3 // 【新增】状态四：回复接收完毕，等待播放结束
+   STATE_PLAYING_FINISHED_WAITING = 3, // 【新增】状态四：回复接收完毕，等待播放结束
+   STATE_PLAYING_WEATHER = 4   // 【新增】状态五：正在播放天气播报
 } system_state_t;
 
 // 全局变量
@@ -91,6 +92,10 @@ static bool user_started_speaking = false;
 // 实时流式传输标志
 static bool is_realtime_streaming = false;
 
+// 天气播报相关标志
+static bool is_weather_report = false;
+static char weather_trigger_source[32] = {0}; // 存储触发者ID
+
 /**
 * @brief WebSocket事件处理函数
 */
@@ -116,24 +121,14 @@ static void on_websocket_event(const WebSocketClient::EventData& event)
            ESP_LOGI(TAG, "二进制数据内容: %s", debug_buf);
        }
        
-       if (audio_manager != nullptr && event.data_len > 0 && current_state == STATE_WAITING_RESPONSE) {
+       if (audio_manager != nullptr && event.data_len > 0 && 
+           (current_state == STATE_WAITING_RESPONSE || current_state == STATE_PLAYING_WEATHER)) {
             // 先检查是否已经开始播放，避免竞态条件重复发送
             bool was_already_streaming = audio_manager->isStreamingActive();
             
             if (!was_already_streaming) {
                 ESP_LOGI(TAG, "开始流式音频播放");
                 audio_manager->startStreamingPlayback();
-                
-                // ✅ 发送播放开始信号 "1" 到服务器（用于控制LED）
-                // 移到 startStreamingPlayback 之后，确保状态已更新
-                if (websocket_client != nullptr && websocket_client->isConnected()) {
-                    int ret = websocket_client->sendText("1");
-                    if (ret > 0) {
-                        ESP_LOGI(TAG, "已发送播放开始信号: 1");
-                    } else {
-                        ESP_LOGW(TAG, "发送播放开始信号失败");
-                    }
-                }
             }
             bool added = audio_manager->addStreamingAudioChunk(event.data, event.data_len);
             
@@ -165,21 +160,19 @@ static void on_websocket_event(const WebSocketClient::EventData& event)
                         // 1. 告诉 AudioManager 网络数据传完了，剩下的自己播完
                         audio_manager->finishStreamingPlayback();
 
-                        // 2. 不要直接切到 STATE_RECORDING，而是切到“等待播放结束”状态
+                        // 2. 根据当前状态决定下一步
                         if (current_state == STATE_WAITING_RESPONSE) {
                             current_state = STATE_PLAYING_FINISHED_WAITING;
+                        } else if (current_state == STATE_PLAYING_WEATHER) {
+                            // 天气播报也在等待播放结束，保持当前状态
+                            ESP_LOGI(TAG, "天气播报接收完成，等待播放结束...");
                         }
                     } else {
-                        // 🔧 修复：如果没有在播放（比如TTS失败返回空音频），直接发送 "0" 并进入录音
+                        // 🔧 修复：如果没有在播放（比如TTS失败返回空音频），
                         ESP_LOGW(TAG, "收到结束信号但没有音频在播放，可能是TTS失败");
 
-                        // 发送 "0" 确保LED熄灭
-                        if (websocket_client != nullptr && websocket_client->isConnected()) {
-                            websocket_client->sendText("0");
-                            ESP_LOGI(TAG, "已发送播放结束信号: 0 (无音频情况)");
-                        }
 
-                        // 直接进入录音状态
+                        // 根据状态决定下一步
                         if (current_state == STATE_WAITING_RESPONSE) {
                             current_state = STATE_RECORDING;
                             audio_manager->clearRecordingBuffer();
@@ -187,6 +180,11 @@ static void on_websocket_event(const WebSocketClient::EventData& event)
                             vad_speech_detected = false;
                             vad_silence_frames = 0;
                             ESP_LOGI(TAG, "进入录音状态（无音频回复）");
+                        } else if (current_state == STATE_PLAYING_WEATHER) {
+                            // 天气播报无音频，返回等待唤醒
+                            current_state = STATE_WAITING_WAKEUP;
+                            is_weather_report = false;
+                            ESP_LOGI(TAG, "天气播报无音频，返回等待唤醒状态");
                         }
                     }
                 } else if (strstr(json_str, "\"event\":\"ping\"") != NULL) {
@@ -196,12 +194,7 @@ static void on_websocket_event(const WebSocketClient::EventData& event)
                 } else if (strstr(json_str, "\"event\":\"error\"") != NULL) {
                     // 处理错误消息
                     ESP_LOGE(TAG, "收到服务器错误消息: %s", json_str);
-                    // 发送 "0" 确保LED熄灭
-                    if (websocket_client != nullptr && websocket_client->isConnected()) {
-                        websocket_client->sendText("0");
-                        ESP_LOGI(TAG, "已发送播放结束信号: 0 (错误情况)");
-                    }
-                    // 直接进入录音状态
+                        // 根据状态决定下一步
                     if (current_state == STATE_WAITING_RESPONSE) {
                         current_state = STATE_RECORDING;
                         audio_manager->clearRecordingBuffer();
@@ -210,6 +203,40 @@ static void on_websocket_event(const WebSocketClient::EventData& event)
                         vad_silence_frames = 0;
                         ESP_LOGI(TAG, "进入录音状态（服务器错误）");
                     }
+                } else if (strstr(json_str, "\"event\":\"play_weather\"") != NULL) {
+                    // 🌤️ 收到天气播报指令
+                    ESP_LOGI(TAG, "收到天气播报指令!");
+                    
+                    // 提取触发者信息
+                    char* triggered_by = strstr(json_str, "\"triggered_by\":\"");
+                    if (triggered_by) {
+                        triggered_by += strlen("\"triggered_by\":\"");
+                        char* end = strchr(triggered_by, '\"');
+                        if (end) {
+                            size_t len = end - triggered_by;
+                            if (len > sizeof(weather_trigger_source) - 1) {
+                                len = sizeof(weather_trigger_source) - 1;
+                            }
+                            strncpy(weather_trigger_source, triggered_by, len);
+                            weather_trigger_source[len] = '\0';
+                        }
+                    }
+                    
+                    // 停止当前录音
+                    if (audio_manager->isRecording()) {
+                        audio_manager->stopRecording();
+                    }
+                    
+                    // 清空缓冲区准备接收天气音频
+                    audio_manager->clearRecordingBuffer();
+                    
+                    // 设置天气播报标志
+                    is_weather_report = true;
+                    
+                    // 切换到天气播报状态
+                    current_state = STATE_PLAYING_WEATHER;
+                    
+                    ESP_LOGI(TAG, "🌤️ 准备接收天气播报音频，触发者: %s", weather_trigger_source);
                 }
                 free(json_str);
             }
@@ -660,18 +687,6 @@ extern "C" void app_main(void)
             // 当数据播完后，会设置 is_streaming = false
             if (!audio_manager->isStreamingActive()) {
                 
-                // ✅ 发送播放结束信号 "0" 到服务器（用于控制LED）
-                if (websocket_client != nullptr && websocket_client->isConnected()) {
-                    int ret = websocket_client->sendText("0");
-                    if (ret > 0) {
-                        ESP_LOGI(TAG, "已发送播放结束信号: 0");
-                    } else {
-                        ESP_LOGW(TAG, "发送播放结束信号失败，连接可能已断开");
-                    }
-                } else {
-                    ESP_LOGW(TAG, "WebSocket未连接，无法发送结束信号");
-                }
-                
                 ESP_LOGI(TAG, "播放逻辑结束，等待硬件静音...");
                 // 等待 I2S 硬件彻底播完，并让扬声器余振消失
                 vTaskDelay(pdMS_TO_TICKS(500)); 
@@ -706,6 +721,42 @@ extern "C" void app_main(void)
                 ESP_LOGI(TAG, "进入连续对话模式，请在10秒内继续说话...");
             } else {
                 // 还在播放尾巴，稍微等一下，不要占用 CPU
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        } else if (current_state == STATE_PLAYING_WEATHER) {
+            // 🌤️ 天气播报播放状态
+            if (!audio_manager->isStreamingActive()) {
+                // 天气播报播放完成
+                ESP_LOGI(TAG, "🌤️ 天气播报播放完成");
+                
+                // 通知服务器天气播报完成
+                if (websocket_client != nullptr && websocket_client->isConnected()) {
+                    const char* weather_done_msg = "{\"event\":\"weather_played\"}";
+                    websocket_client->sendText(weather_done_msg);
+                    ESP_LOGI(TAG, "已通知服务器天气播报完成");
+                }
+                
+                // 等待硬件稳定
+                vTaskDelay(pdMS_TO_TICKS(500));
+                
+                // 重置天气播报标志
+                is_weather_report = false;
+                memset(weather_trigger_source, 0, sizeof(weather_trigger_source));
+                
+                // 返回等待唤醒状态（天气播报后不进入连续对话）
+                current_state = STATE_WAITING_WAKEUP;
+                
+                // 重置所有状态
+                vad_speech_detected = false;
+                vad_silence_frames = 0;
+                is_continuous_conversation = false;
+                user_started_speaking = false;
+                recording_timeout_start = 0;
+                is_realtime_streaming = false;
+                
+                ESP_LOGI(TAG, "天气播报结束，返回等待唤醒状态，请说出唤醒词 '你好小智'");
+            } else {
+                // 还在播放中
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
         }
